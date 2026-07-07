@@ -1,22 +1,47 @@
 # Notes
-
-A short writeup to submit with your repo. Keep it brief: a page or two is plenty.
-
+ 
 ## Decisions
-
-- What you chose to build, what you deliberately left out, and why.
-- How you modeled issues, pull requests, reviews, statuses, and timeline spans.
-- Where you put app-owned state, such as lane placement or planned starts, and how you
-  reasoned about it.
-
-## Tradeoffs / what you'd do next
-
-- Known rough edges or incomplete areas.
-- What you would improve with more time.
-- Any assumptions you made about the product or data.
-
+ 
+**Normalization lives in one place, `lib/gantt/normalize.ts`, independent of any component.** Raw Linear issues and raw GitHub PRs go in, `NormalizedIssue[]` comes out, and everything downstream (timeline math, components) only ever touches that normalized shape. Normalization is where the real risk in this project lives: identity resolution, PR matching, and review pairing all have real edge cases in the seed. I wanted this correct and checkable on its own before any UI sat on top of it.
+ 
+**PR-to-issue matching: branch first, title as fallback.** Linear's own GitHub integration generates branch names that embed the issue identifier (`<login>/orb-101-slug`) when you copy a branch name from an issue. That's the primary, structural signal, coming from the tool itself. Title (`ORB-104: ...`) is the fallback for PRs where the branch was renamed away from Linear's generated name, since a title is just free text a person typed and more prone to inconsistency or accidental pattern matches. The seed never has both signals disagreeing on which issue a PR belongs to, so there was no fixture forcing a tiebreak. This was my own call, and I went branch-first because it mirrors how the real integration actually works, not as a defensive hedge.
+ 
+**Stacked PRs (e.g. #508/#509 on ORB-106) render as one issue bar with a row of PR dots underneath**, connected by a thin line when one PR's base branch is another's head branch. The issue-level status badge reflects the worst reviewer state across the whole stack, not the best. An issue with one approved PR and one still-pending PR in its chain isn't done, because the feature isn't shippable until every PR in it clears. I used the same worst-of-the-set rule for aggregating multiple reviewers on a single PR, for the same reason: the board's job is showing what's actually shippable right now, and surfacing the best signal instead would hide the real blocker.
+ 
+**Mooted review requests are dropped, not shown de-emphasized.** A request is "mooted" when a `ReviewRequestedEvent` never got a submission and the PR is already `MERGED`/`CLOSED` (e.g. #505). There's nothing left to act on: the code already merged before anyone looked, so keeping it around is just noise, not history anyone needs at standup. The distinguishing signal from a genuinely pending request is PR state: unresolved and `OPEN` means pending and actionable; unresolved and `MERGED`/`CLOSED` means mooted.
+ 
+**Re-requested reviews use the latest request event, not the earliest.** For a reviewer with a request, removal, re-request history (#507, #530, #536), only a submission timestamped after the most recent request counts as satisfying it. A stale approval from before a re-request is treated as if it never happened, so the reviewer shows as pending again. Otherwise a re-request for a fresh look would silently still read as approved.
+ 
+**Bot and outside-contributor filtering is identity-based, not a naming heuristic.** GitHub actors only carry a `login`; there's no flag or email on the wire shape. `resolveActor()` joins a login against `TEAM` (login to id/name); anything that doesn't resolve gets filtered as a reviewer/obligation. That does not mean outside-authored PRs are hidden outright: #533/#540 map to real issues (ORB-125, ORB-130) with team reviewers assigned, and those are real obligations for the team even though the author isn't one of us.
+ 
+**Planned start is explicit, user-set, and persisted in `localStorage`, never inferred.** Linear has no writable start date (`store.ts` rejects any attempt), so a planned start had to be app-owned client state. I decided it should be explicit rather than derived from "due date minus an estimate," because there's no estimate field anywhere in this data, and inferring one would mean fabricating a second synthetic number on top of already-fictional seed data. It persists in `localStorage` keyed by issue id, not just in memory, because the point of the feature is a day-over-day plan-vs-actual comparison during standup. If it reset on refresh there'd be nothing to compare tomorrow. It never overrides a real `startedAt` once Linear has one, and no ghost bar renders until someone actually sets it.
+ 
+**Status families group Linear's workflow states into six buckets** (planned, active, review, deployed, done, cancelled) rather than coloring every state name independently. Automation-owned states (`In Review`, `On Develop`, `On Staging`, `On Prod`) get their own review/deployed families since they represent pipeline progress, not a person's manual choice. A manually-owned state (`Design Exploration`, etc.) with a `startedAt` set still counts as active work even though it isn't `In Progress` by name.
+ 
+**Overlapping issues within one person's row are packed into sub-lanes** with a greedy interval-scheduling algorithm rather than one row per issue regardless of overlap. This became necessary once a person has 5-7 concurrent issues, which several teammates do in the seed.
+ 
+**The review queue groups by reviewer and ranks by staleness, showing only `PENDING` obligations** (not `CHANGES_REQUESTED`/`COMMENTED`, since those are already-submitted opinions now waiting on the author, not something sitting in a reviewer's queue). Within each person, their oldest outstanding request leads. People are themselves ordered by their single oldest request, so whoever's been sitting on something the longest surfaces first (Sam Okafor's week-old #531 request leads the whole list). This answers "which PRs need attention" directly, instead of requiring someone to scan every bar on the board.
+ 
+**Dialogs get a real focus trap, Escape-to-close, and restore focus to whatever opened them**, via a small shared `Modal` wrapper the issue panel, the new-issue form, and the review queue all use. I cut this from the first pass for time and added it back deliberately. A modal a keyboard or screen-reader user can't escape is broken, not just unpolished, and it was worth the extra hour.
+ 
+**Two bugs a code review pass caught, and how I fixed them:**
+- Unscheduled issues (no start, no due date) were a dead end. The "+N unscheduled" badge had no click handler, and any issue created without a due date, which the new-issue form allows, became permanently unreachable: no bar exists for it, so there was no way to open it, change its status, or give it a due date. I fixed this by making each unscheduled issue its own clickable chip, wired to the same selection path as a normal bar.
+- Manually setting an issue to an automation-owned state (`In Progress`, `In Review`, etc.) with no start data would silently produce a bar colored "active" with nowhere real to place it, because real Linear auto-stamps `startedAt` on that transition and my fake store deliberately doesn't replicate that. I closed this by blocking the transition client-side until a planned start exists, with an inline explanation and focus moved to the right field.
+**Orphaned PRs (no resolvable Linear identifier) are attributed to their author and shown as small link chips in that person's row**, not just counted and dropped. A team member's open PR with no Linear issue behind it is still something a standup might want to ask about. #524/#532 (Priya), #525 (Ingrid), #526/#527 (Theo/Dana) all show up this way, colored by their own review state. PRs from a bot, an outside contributor, or a ghost author (no `authorId` at all) aren't attributed to anyone, since there's no teammate to surface them under.
+ 
+**Reassignment writes through `issueUpdate`, but can only reassign to a teammate, not clear an assignee back to unassigned.** That's not my restriction: fake-Linear's `updateIssue` calls `resolveAssignee()` unconditionally whenever `assigneeId` is present, with no null-check the way `issueCreate` has, so passing `null` on an update throws. I matched the UI to that real constraint (no "Unassigned" option once an issue has an assignee) rather than patch the fake source to make my own life easier.
+ 
+## Tradeoffs / what's incomplete
+ 
+- **No drag interaction for planned start.** It's a date input in the issue detail panel, not a draggable ghost bar on the timeline. This fits the Gantt idiom better, but I cut it for time.
+- **No search, filter, or zoom controls**, and I excluded CLOSED pull requests from fetching entirely. They're neither active work nor something that just shipped, and fetching them would have doubled the network calls for no standup-relevant signal.
+- **No automated tests for the normalization layer.** The existing `lib/fake-source/*.test.ts` suite documents the fake source itself. I verified `lib/gantt/*` by hand against the seeded edge cases (stack, mooted, bot, outside-contributor, branch-vs-title, clipped-left/right, no-span) in a running browser, not with a test file that would catch a regression later. This is the first thing I'd add with more time.
+- **State transitions aren't constrained.** The status dropdown offers every state name seen in the seed, including automation-owned ones a human wouldn't normally set by hand (e.g. `On Prod`). I'd restrict manual transitions and leave automation-owned states to automation in a real version.
 ## AI tool usage
-
-- Which tools you used.
-- How you directed them, where you pushed back, and what you changed by hand.
-- How you verified the generated code or designs.
+ 
+I used Claude Code as an implementation tool, not a design tool. I decided the product rules myself before any code existed: branch-vs-title priority for PR matching, worst-of-the-set status aggregation for stacked PRs and multi-reviewer PRs, dropping (not dimming) mooted reviews, how re-requests should resolve, how bot filtering should work, and how planned start should persist. Only after deciding these did I have Claude Code build against them.
+ 
+A few examples of the reasoning behind those calls: I went branch-before-title for PR matching because Linear's own GitHub integration bakes the issue id into the branch name when you copy it from an issue. That's a structural signal from the tool itself, while a title is just free text a person typed. I used worst-of-the-set instead of best-of-the-set for stacked PRs and multi-reviewer aggregation because the board's job is showing what's actually shippable right now. One approval out of three reviewers, or one merged PR in a two-PR stack, doesn't mean the feature is unblocked, so surfacing the best signal would hide the real blocker. I drop mooted reviews rather than showing them dimmed because there's nothing left to act on: the code already merged before anyone looked, so keeping them around is just noise, not history anyone needs at standup.
+ 
+Once I had Claude Code implement the normalization layer, timeline logic, and components, I verified the output myself against the seed's actual edge cases in a running browser, the ORB-106 PR stack, the #505 mooted review, the #506 bot reviewer, rather than reading the code and assuming it was correct. That caught real bugs, including Three dialogs able to stack open at once, which I had corrected and re-verified.
+ 

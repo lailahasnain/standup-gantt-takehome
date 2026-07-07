@@ -1,118 +1,154 @@
 "use client";
 
-// Starting skeleton: a near-empty home page with a single working example fetch
-// against the Fake source, so you can confirm data is flowing and see the raw
-// Linear + GitHub payload shapes within minutes -- before spending your time budget.
-//
-// Deliberately minimal: it does NOT normalize, project, or render a Gantt. It posts a
-// GraphQL read to each endpoint and pretty-prints exactly what the wire returns.
-// Building the Gantt on top of these raw payloads is your job.
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { createIssue, fetchGithubPullRequests, fetchLinearIssues, updateIssue, type IssueCreateInput } from "@/lib/gantt/client";
+import { normalize } from "@/lib/gantt/normalize";
+import { usePlannedStarts } from "@/lib/gantt/usePlannedStart";
+import { buildReviewQueue } from "@/lib/gantt/reviewQueue";
+import { BoardSkeleton } from "./components/BoardSkeleton";
+import { GanttBoard } from "./components/GanttBoard";
+import { IssueDetailPanel } from "./components/IssueDetailPanel";
+import { NewIssueDialog } from "./components/NewIssueDialog";
+import { ReviewQueuePanel } from "./components/ReviewQueuePanel";
+import { StatusLegend } from "./components/StatusLegend";
+import styles from "./gantt.module.css";
+import panelStyles from "./panels.module.css";
 
-import { useEffect, useState } from "react";
+type ActiveModal = { type: "issue"; issueId: string } | { type: "newIssue" } | { type: "reviewQueue" } | null;
 
-// An example `issues` GraphQL query, trimmed to the field set fake-Linear serves.
-// Replace or extend it as you build.
-const ISSUES_QUERY = `
-  query ExampleIssues {
-    issues {
-      nodes {
-        id
-        identifier
-        title
-        url
-        startedAt
-        dueDate
-        state { name }
-        assignee { id name displayName email }
-        project { id name }
-        projectMilestone { id name }
-      }
-      pageInfo { hasNextPage endCursor }
-    }
-  }
-`;
-
-// The PR discovery query fake-GitHub serves (one repo + state per call). You normalize
-// the nested reviews and review-request timeline yourself. Example: orbital/voyager's
-// OPEN pull requests.
-const PULL_REQUESTS_QUERY = `
-  query ExamplePullRequests($owner: String!, $name: String!, $state: PullRequestState!) {
-    repository(owner: $owner, name: $name) {
-      pullRequests(states: [$state]) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          number title state createdAt mergedAt closedAt updatedAt headRefName baseRefName url
-          author { login }
-          commits(first: 1) { nodes { commit { committedDate authoredDate } } }
-          reviews(first: 100) { nodes { author { login } state submittedAt } }
-          timelineItems(first: 100, itemTypes: [REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT]) {
-            nodes {
-              __typename
-              ... on ReviewRequestedEvent { createdAt requestedReviewer { ... on User { login } ... on Bot { login } } }
-              ... on ReviewRequestRemovedEvent { createdAt requestedReviewer { ... on User { login } ... on Bot { login } } }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-async function postGraphql(
-  endpoint: string,
-  label: string,
-  query: string,
-  variables?: Record<string, unknown>
-): Promise<unknown> {
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  if (!res.ok) throw new Error(`${label} responded ${res.status}`);
-  return res.json();
-}
-
-export default function FakeExamplePage() {
-  const [linear, setLinear] = useState<unknown>(null);
-  const [github, setGithub] = useState<unknown>(null);
+export default function StandupGanttPage() {
+  const [rawIssues, setRawIssues] = useState<Awaited<ReturnType<typeof fetchLinearIssues>> | null>(null);
+  const [rawPrs, setRawPrs] = useState<Awaited<ReturnType<typeof fetchGithubPullRequests>> | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // One tagged state so only one dialog can ever be open at a time.
+  const [activeModal, setActiveModal] = useState<ActiveModal>(null);
 
-  useEffect(() => {
-    Promise.all([
-      postGraphql("/api/fake/linear", "fake-Linear", ISSUES_QUERY).then(setLinear),
-      postGraphql("/api/fake/github", "fake-GitHub", PULL_REQUESTS_QUERY, {
-        owner: "orbital",
-        name: "voyager",
-        state: "OPEN",
-      }).then(setGithub),
-    ]).catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+  const { plannedStarts, setPlannedStart } = usePlannedStarts();
+
+  const load = useCallback(() => {
+    setError(null);
+    Promise.all([fetchLinearIssues(), fetchGithubPullRequests()])
+      .then(([issues, prs]) => {
+        setRawIssues(issues);
+        setRawPrs(prs);
+      })
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
   }, []);
 
-  const block = (testid: string, payload: unknown) =>
-    payload === null ? (
-      <p>Loading...</p>
-    ) : (
-      <pre
-        data-testid={testid}
-        style={{ background: "#f5f5f5", padding: "1rem", overflowX: "auto", borderRadius: 6 }}
-      >
-        {JSON.stringify(payload, null, 2)}
-      </pre>
-    );
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const now = useMemo(() => new Date(), []);
+  const result = useMemo(
+    () => (rawIssues && rawPrs ? normalize(rawIssues, rawPrs) : null),
+    [rawIssues, rawPrs]
+  );
+
+  const selectedIssue = useMemo(
+    () =>
+      activeModal?.type === "issue"
+        ? (result?.issues.find((i) => i.id === activeModal.issueId) ?? null)
+        : null,
+    [result, activeModal]
+  );
+
+  const reviewQueue = useMemo(() => (result ? buildReviewQueue(result.issues) : []), [result]);
+  const pendingReviewCount = reviewQueue.reduce((sum, g) => sum + g.entries.length, 0);
+
+  async function handleCreate(input: IssueCreateInput) {
+    await createIssue(input);
+    load();
+  }
+
+  async function handleUpdateState(stateName: string) {
+    if (!selectedIssue) return;
+    await updateIssue(selectedIssue.id, { stateId: stateName });
+    load();
+  }
+
+  async function handleUpdateDueDate(date: string | null) {
+    if (!selectedIssue) return;
+    await updateIssue(selectedIssue.id, { dueDate: date });
+    load();
+  }
+
+  async function handleUpdateAssignee(assigneeId: string | null) {
+    if (!selectedIssue) return;
+    await updateIssue(selectedIssue.id, { assigneeId });
+    load();
+  }
 
   return (
-    <main style={{ fontFamily: "ui-monospace, monospace", padding: "2rem", lineHeight: 1.5 }}>
-      <p>Standup Gantt takehome. Build your Gantt here. Raw Fake source payloads below.</p>
-      {error ? (
-        <pre style={{ color: "crimson" }}>Error: {error}</pre>
-      ) : (
-        <>
-          <p>Raw fake-Linear payload (issues):</p>
-          {block("fake-linear-payload", linear)}
-          <p>Raw fake-GitHub payload (orbital/voyager open pull requests):</p>
-          {block("fake-github-payload", github)}
-        </>
+    <main className={styles.page}>
+      <div className={styles.header}>
+        <div>
+          <h1 className={styles.title}>Standup Gantt</h1>
+          <p className={styles.subtitle}>Orbital team &middot; issues and pull requests, grouped by person</p>
+        </div>
+        <div className={styles.headerActions}>
+          <StatusLegend />
+          <button
+            type="button"
+            className={panelStyles.queueButton}
+            onClick={() => setActiveModal({ type: "reviewQueue" })}
+          >
+            Review queue
+            {pendingReviewCount > 0 && <span className={panelStyles.queueBadge}>{pendingReviewCount}</span>}
+          </button>
+          <button
+            type="button"
+            className={styles.primaryButton}
+            onClick={() => setActiveModal({ type: "newIssue" })}
+          >
+            + New issue
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className={styles.errorState}>
+          <p>Couldn&apos;t load the board: {error}</p>
+          <button type="button" className={styles.primaryButton} onClick={load}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!error && !result && <BoardSkeleton />}
+
+      {!error && result && result.people.length === 0 && (
+        <div className={styles.emptyState}>No issues yet. Create the first one to get started.</div>
+      )}
+
+      {!error && result && result.people.length > 0 && (
+        <GanttBoard
+          people={result.people}
+          plannedStarts={plannedStarts}
+          now={now}
+          selectedIssueId={activeModal?.type === "issue" ? activeModal.issueId : null}
+          onSelectIssue={(issueId) => setActiveModal({ type: "issue", issueId })}
+        />
+      )}
+
+      {selectedIssue && (
+        <IssueDetailPanel
+          issue={selectedIssue}
+          plannedStart={plannedStarts[selectedIssue.id] ?? null}
+          onSetPlannedStart={(date) => setPlannedStart(selectedIssue.id, date)}
+          onUpdateState={handleUpdateState}
+          onUpdateDueDate={handleUpdateDueDate}
+          onUpdateAssignee={handleUpdateAssignee}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+
+      {activeModal?.type === "newIssue" && (
+        <NewIssueDialog onCreate={handleCreate} onClose={() => setActiveModal(null)} />
+      )}
+
+      {activeModal?.type === "reviewQueue" && (
+        <ReviewQueuePanel groups={reviewQueue} now={now} onClose={() => setActiveModal(null)} />
       )}
     </main>
   );

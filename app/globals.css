@@ -10,3 +10,15 @@ body {
   color: #18241b;
   background: #eef3ea;
 }
+
+/* One consistent, on-brand focus ring for every interactive element, rather than
+   leaving keyboard-nav visibility to whatever the browser default happens to be
+   (which reads poorly against the colored issue bars). */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #1d5c39;
+  outline-offset: 2px;
+}
